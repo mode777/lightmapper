@@ -710,8 +710,29 @@ static void lm_writeResultsToLightmap(lm_context *ctx)
 {
 	// do the GPU->CPU transfer of downsampled hemispheres
 	float *hemi = (float*)LM_CALLOC(ctx->lightmap.width * ctx->lightmap.height, 4 * sizeof(float));
+
+#if defined(__EMSCRIPTEN__)
+	// WebGL has no glGetTexImage, so read back through an FBO attachment.
+	GLint prevFramebuffer = 0;
+	GLint prevReadBuffer = 0;
+	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFramebuffer);
+	glGetIntegerv(GL_READ_BUFFER, &prevReadBuffer);
+
+	GLuint readbackFramebuffer = 0;
+	glGenFramebuffers(1, &readbackFramebuffer);
+	glBindFramebuffer(GL_FRAMEBUFFER, readbackFramebuffer);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, ctx->hemisphere.storage.texture, 0);
+	assert(glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
+	glReadBuffer(GL_COLOR_ATTACHMENT0);
+	glReadPixels(0, 0, ctx->lightmap.width, ctx->lightmap.height, GL_RGBA, GL_FLOAT, hemi);
+
+	glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prevFramebuffer);
+	glReadBuffer((GLenum)prevReadBuffer);
+	glDeleteFramebuffers(1, &readbackFramebuffer);
+#else
 	glBindTexture(GL_TEXTURE_2D, ctx->hemisphere.storage.texture);
 	glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_FLOAT, hemi);
+#endif
 
 	// write results to lightmap texture
 	for (int y = 0; y < ctx->hemisphere.storage.writePosition.y + (int)ctx->hemisphere.fbHemiCountY; y++)
@@ -1215,6 +1236,46 @@ lm_context *lmCreate(int hemisphereSize, float zNear, float zFar,
 
 	// hemisphere shader (weighted downsampling of the 3x1 hemisphere layout to a 0.5x0.5 square)
 	{
+		#if defined(__EMSCRIPTEN__)
+		const char *vs =
+			"#version 300 es\n"
+			"const vec2 ps[4] = vec2[](vec2(1, -1), vec2(1, 1), vec2(-1, -1), vec2(-1, 1));\n"
+			"void main()\n"
+			"{\n"
+				"gl_Position = vec4(ps[gl_VertexID], 0, 1);\n"
+			"}\n";
+		const char *fs =
+			"#version 300 es\n"
+			"precision highp float;\n"
+			"precision highp int;\n"
+			"uniform sampler2D hemispheres;\n"
+			"uniform sampler2D weights;\n"
+			"out vec4 outColor;\n"
+			"vec4 weightedSample(ivec2 h_uv, ivec2 w_uv, ivec2 quadrant)\n"
+			"{\n"
+				"vec4 texSample = texelFetch(hemispheres, h_uv + quadrant, 0);\n"
+				"vec2 weight = texelFetch(weights, w_uv + quadrant, 0).rg;\n"
+				"return vec4(texSample.rgb * weight.r, texSample.a * weight.g);\n"
+			"}\n"
+			"vec4 threeWeightedSamples(ivec2 h_uv, ivec2 w_uv, ivec2 offset)\n"
+			"{\n"
+				"vec4 sum = weightedSample(h_uv, w_uv, offset);\n"
+				"sum += weightedSample(h_uv, w_uv, offset + ivec2(2, 0));\n"
+				"sum += weightedSample(h_uv, w_uv, offset + ivec2(4, 0));\n"
+				"return sum;\n"
+			"}\n"
+			"void main()\n"
+			"{\n"
+				"vec2 in_uv = gl_FragCoord.xy * vec2(6.0, 2.0) + vec2(0.5);\n"
+				"ivec2 h_uv = ivec2(in_uv);\n"
+				"ivec2 w_uv = ivec2(mod(in_uv, vec2(textureSize(weights, 0))));\n"
+				"vec4 lb = threeWeightedSamples(h_uv, w_uv, ivec2(0, 0));\n"
+				"vec4 rb = threeWeightedSamples(h_uv, w_uv, ivec2(1, 0));\n"
+				"vec4 lt = threeWeightedSamples(h_uv, w_uv, ivec2(0, 1));\n"
+				"vec4 rt = threeWeightedSamples(h_uv, w_uv, ivec2(1, 1));\n"
+				"outColor = lb + rb + lt + rt;\n"
+			"}\n";
+		#else
 		const char *vs =
 			"#version 150 core\n"
 			"const vec2 ps[4] = vec2[](vec2(1, -1), vec2(1, 1), vec2(-1, -1), vec2(-1, 1));\n"
@@ -1257,6 +1318,7 @@ lm_context *lmCreate(int hemisphereSize, float zNear, float zFar,
 				"vec4 rt = threeWeightedSamples(h_uv, w_uv, ivec2(1, 1));\n"
 				"outColor = lb + rb + lt + rt;\n"
 			"}\n";
+		#endif
 		ctx->hemisphere.firstPass.programID = lm_LoadProgram(vs, fs);
 		if (!ctx->hemisphere.firstPass.programID)
 		{
@@ -1274,6 +1336,30 @@ lm_context *lmCreate(int hemisphereSize, float zNear, float zFar,
 
 	// downsample shader
 	{
+		#if defined(__EMSCRIPTEN__)
+		const char *vs =
+			"#version 300 es\n"
+			"const vec2 ps[4] = vec2[](vec2(1, -1), vec2(1, 1), vec2(-1, -1), vec2(-1, 1));\n"
+			"void main()\n"
+			"{\n"
+				"gl_Position = vec4(ps[gl_VertexID], 0, 1);\n"
+			"}\n";
+		const char *fs =
+			"#version 300 es\n"
+			"precision highp float;\n"
+			"precision highp int;\n"
+			"uniform sampler2D hemispheres;\n"
+			"out vec4 outColor;\n"
+			"void main()\n"
+			"{\n"
+				"ivec2 h_uv = ivec2(gl_FragCoord.xy) * 2;\n"
+				"vec4 lb = texelFetch(hemispheres, h_uv + ivec2(0, 0), 0);\n"
+				"vec4 rb = texelFetch(hemispheres, h_uv + ivec2(1, 0), 0);\n"
+				"vec4 lt = texelFetch(hemispheres, h_uv + ivec2(0, 1), 0);\n"
+				"vec4 rt = texelFetch(hemispheres, h_uv + ivec2(1, 1), 0);\n"
+				"outColor = lb + rb + lt + rt;\n"
+			"}\n";
+		#else
 		const char *vs =
 			"#version 150 core\n"
 			"const vec2 ps[4] = vec2[](vec2(1, -1), vec2(1, 1), vec2(-1, -1), vec2(-1, 1));\n"
@@ -1298,6 +1384,7 @@ lm_context *lmCreate(int hemisphereSize, float zNear, float zFar,
 				"vec4 rt = texelFetch(hemispheres, h_uv + ivec2(1, 1), 0);\n"
 				"outColor = lb + rb + lt + rt;\n"
 			"}\n";
+		#endif
 		ctx->hemisphere.downsamplePass.programID = lm_LoadProgram(vs, fs);
 		if (!ctx->hemisphere.downsamplePass.programID)
 		{

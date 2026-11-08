@@ -1265,10 +1265,9 @@ lm_context *lmCreate(int hemisphereSize, float zNear, float zFar,
 				"return sum;\n"
 			"}\n"
 			"void main()\n"
-			"{\n"
-				"vec2 in_uv = gl_FragCoord.xy * vec2(6.0, 2.0) + vec2(0.5);\n"
-				"ivec2 h_uv = ivec2(in_uv);\n"
-				"ivec2 w_uv = ivec2(mod(in_uv, vec2(textureSize(weights, 0))));\n"
+			"{\n" // GLES3 gl_FragCoord is at half-integer pixel centers; truncate to the output texel before scaling
+				"ivec2 h_uv = ivec2(gl_FragCoord.xy) * ivec2(6, 2);\n"
+				"ivec2 w_uv = ivec2(mod(vec2(h_uv), vec2(textureSize(weights, 0))));\n"
 				"vec4 lb = threeWeightedSamples(h_uv, w_uv, ivec2(0, 0));\n"
 				"vec4 rb = threeWeightedSamples(h_uv, w_uv, ivec2(1, 0));\n"
 				"vec4 lt = threeWeightedSamples(h_uv, w_uv, ivec2(0, 1));\n"

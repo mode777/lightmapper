@@ -355,6 +355,9 @@ struct lm_context
 		struct
 		{
 			GLuint texture;
+			GLuint readbackFramebuffer;
+			float *readbackBuffer;
+			size_t readbackBufferCount;
 			lm_ivec2 writePosition;
 			lm_ivec2 *toLightmapLocation;
 		} storage;
@@ -708,39 +711,83 @@ static void lm_integrateHemisphereBatch(lm_context *ctx)
 
 static void lm_writeResultsToLightmap(lm_context *ctx)
 {
-	// do the GPU->CPU transfer of downsampled hemispheres
-	float *hemi = (float*)LM_CALLOC(ctx->lightmap.width * ctx->lightmap.height, 4 * sizeof(float));
+	// transfer only the rows that contain hemisphere batches written in this pass
+	int rowsToRead = ctx->hemisphere.storage.writePosition.y + (int)ctx->hemisphere.fbHemiCountY;
+	if (rowsToRead > ctx->lightmap.height)
+		rowsToRead = ctx->lightmap.height;
+	if (rowsToRead < 0)
+		rowsToRead = 0;
+
+	// reuse one CPU staging buffer; only grow it when a larger lightmap is used
+	size_t requiredReadbackFloats = (size_t)ctx->lightmap.width * (size_t)ctx->lightmap.height * 4;
+	if (ctx->hemisphere.storage.readbackBufferCount < requiredReadbackFloats)
+	{
+		LM_FREE(ctx->hemisphere.storage.readbackBuffer);
+		ctx->hemisphere.storage.readbackBuffer = (float*)LM_CALLOC(requiredReadbackFloats, sizeof(float));
+		ctx->hemisphere.storage.readbackBufferCount = ctx->hemisphere.storage.readbackBuffer ? requiredReadbackFloats : 0;
+	}
+
+	float *hemi = ctx->hemisphere.storage.readbackBuffer;
+	lm_bool readbackSucceeded = hemi ? LM_TRUE : LM_FALSE;
+	if (!readbackSucceeded)
+		fprintf(stderr, "Lightmapper: could not allocate the readback buffer; skipping lightmap readback\n");
 
 #if defined(__EMSCRIPTEN__)
 	// WebGL has no glGetTexImage, so read back through an FBO attachment.
-	GLint prevFramebuffer = 0;
+	GLint prevReadFramebuffer = 0;
+	GLint prevDrawFramebuffer = 0;
 	GLint prevReadBuffer = 0;
-	glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFramebuffer);
+	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevReadFramebuffer);
+	glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevDrawFramebuffer);
 	glGetIntegerv(GL_READ_BUFFER, &prevReadBuffer);
 
-	GLuint readbackFramebuffer = 0;
-	glGenFramebuffers(1, &readbackFramebuffer);
-	glBindFramebuffer(GL_FRAMEBUFFER, readbackFramebuffer);
-	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, ctx->hemisphere.storage.texture, 0);
-	assert(glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
-	glReadBuffer(GL_COLOR_ATTACHMENT0);
-	glReadPixels(0, 0, ctx->lightmap.width, ctx->lightmap.height, GL_RGBA, GL_FLOAT, hemi);
+	if (readbackSucceeded && rowsToRead > 0)
+	{
+		if (!ctx->hemisphere.storage.readbackFramebuffer)
+			glGenFramebuffers(1, &ctx->hemisphere.storage.readbackFramebuffer);
 
-	glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prevFramebuffer);
+		if (ctx->hemisphere.storage.readbackFramebuffer)
+		{
+			glBindFramebuffer(GL_FRAMEBUFFER, ctx->hemisphere.storage.readbackFramebuffer);
+			glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, ctx->hemisphere.storage.texture, 0);
+
+			GLenum framebufferStatus = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+			if (framebufferStatus == GL_FRAMEBUFFER_COMPLETE)
+			{
+				glReadBuffer(GL_COLOR_ATTACHMENT0);
+				glReadPixels(0, 0, ctx->lightmap.width, rowsToRead, GL_RGBA, GL_FLOAT, hemi);
+			}
+			else
+			{
+				fprintf(stderr, "Lightmapper: readback framebuffer is incomplete (status 0x%04X); skipping lightmap readback\n", (unsigned int)framebufferStatus);
+				readbackSucceeded = LM_FALSE;
+			}
+		}
+		else
+		{
+			fprintf(stderr, "Lightmapper: could not create the readback framebuffer; skipping lightmap readback\n");
+			readbackSucceeded = LM_FALSE;
+		}
+	}
+
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, (GLuint)prevReadFramebuffer);
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, (GLuint)prevDrawFramebuffer);
 	glReadBuffer((GLenum)prevReadBuffer);
-	glDeleteFramebuffers(1, &readbackFramebuffer);
 #else
-	glBindTexture(GL_TEXTURE_2D, ctx->hemisphere.storage.texture);
-	glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_FLOAT, hemi);
+	if (readbackSucceeded && rowsToRead > 0)
+	{
+		glBindTexture(GL_TEXTURE_2D, ctx->hemisphere.storage.texture);
+		glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_FLOAT, hemi);
+	}
 #endif
 
 	// write results to lightmap texture
-	for (int y = 0; y < ctx->hemisphere.storage.writePosition.y + (int)ctx->hemisphere.fbHemiCountY; y++)
+	for (int y = 0; y < rowsToRead; y++)
 	{
 		for (int x = 0; x < ctx->lightmap.width; x++)
 		{
 			lm_ivec2 lmUV = ctx->hemisphere.storage.toLightmapLocation[y * ctx->lightmap.width + x];
-			if (lmUV.x >= 0)
+			if (readbackSucceeded && lmUV.x >= 0)
 			{
 				float *c = hemi + (y * ctx->lightmap.width + x) * 4;
 				float validity = c[3];
@@ -783,7 +830,6 @@ static void lm_writeResultsToLightmap(lm_context *ctx)
 		}
 	}
 
-	LM_FREE(hemi);
 	ctx->hemisphere.storage.writePosition = lm_i2(0, 0);
 }
 
@@ -1432,10 +1478,12 @@ void lmDestroy(lm_context *ctx)
 	glDeleteVertexArrays(1, &ctx->hemisphere.vao);
 	glDeleteRenderbuffers(1, &ctx->hemisphere.fbDepth);
 	glDeleteFramebuffers(2, ctx->hemisphere.fb);
+	if (ctx->hemisphere.storage.readbackFramebuffer)
+		glDeleteFramebuffers(1, &ctx->hemisphere.storage.readbackFramebuffer);
 	glDeleteTextures(2, ctx->hemisphere.fbTexture);
-	glDeleteTextures(1, &ctx->hemisphere.storage.texture);
 
 	// free memory
+	LM_FREE(ctx->hemisphere.storage.readbackBuffer);
 	LM_FREE(ctx->hemisphere.storage.toLightmapLocation);
 	LM_FREE(ctx->hemisphere.fbHemiToLightmapLocation);
 #ifdef LM_DEBUG_INTERPOLATION

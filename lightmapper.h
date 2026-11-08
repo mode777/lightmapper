@@ -14,6 +14,20 @@
 #ifndef LIGHTMAPPER_H
 #define LIGHTMAPPER_H
 
+/*
+ * LM_GLES3 selects the GLES3/WebGL2 shader and framebuffer-readback path.
+ * It is auto-detected from GL_ES_VERSION_3_0, which GLES3 headers define, and
+ * may be overridden by defining LM_GLES3 to 1 (ES) or 0 (desktop) before
+ * including this header. Include the GL headers before lightmapper.h.
+ */
+#ifndef LM_GLES3
+#if defined(GL_ES_VERSION_3_0)
+#define LM_GLES3 1
+#else
+#define LM_GLES3 0
+#endif
+#endif
+
 #ifdef __cplusplus
 #define LM_DEFAULT_VALUE(value) = value
 #else
@@ -732,8 +746,9 @@ static void lm_writeResultsToLightmap(lm_context *ctx)
 	if (!readbackSucceeded)
 		fprintf(stderr, "Lightmapper: could not allocate the readback buffer; skipping lightmap readback\n");
 
-#if defined(__EMSCRIPTEN__)
-	// WebGL has no glGetTexImage, so read back through an FBO attachment.
+// WebGL2/GLES3 has no glGetTexImage, so read back through an FBO attachment.
+// The RGBA32F render targets and float readback require EXT_color_buffer_float.
+#if LM_GLES3
 	GLint prevReadFramebuffer = 0;
 	GLint prevDrawFramebuffer = 0;
 	GLint prevReadBuffer = 0;
@@ -1282,7 +1297,7 @@ lm_context *lmCreate(int hemisphereSize, float zNear, float zFar,
 
 	// hemisphere shader (weighted downsampling of the 3x1 hemisphere layout to a 0.5x0.5 square)
 	{
-		#if defined(__EMSCRIPTEN__)
+		#if LM_GLES3
 		const char *vs =
 			"#version 300 es\n"
 			"const vec2 ps[4] = vec2[](vec2(1, -1), vec2(1, 1), vec2(-1, -1), vec2(-1, 1));\n"
@@ -1381,7 +1396,7 @@ lm_context *lmCreate(int hemisphereSize, float zNear, float zFar,
 
 	// downsample shader
 	{
-		#if defined(__EMSCRIPTEN__)
+		#if LM_GLES3
 		const char *vs =
 			"#version 300 es\n"
 			"const vec2 ps[4] = vec2[](vec2(1, -1), vec2(1, 1), vec2(-1, -1), vec2(-1, 1));\n"

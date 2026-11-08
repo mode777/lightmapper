@@ -11,6 +11,16 @@ While the simple example application demonstrates the baking of ambient occlusio
 
 Any light shapes and emissive surfaces are supported as long as you draw them with their corresponding emissive light colors.
 
+# WebGL2 / OpenGL ES 3.0
+Include the GL headers before `lightmapper.h`. The GLES3 shader and
+framebuffer-readback path is selected when `GL_ES_VERSION_3_0` is defined by
+the GLES3 headers; it is no longer selected by `__EMSCRIPTEN__`. Define
+`LM_GLES3` to `1` or `0` before including the header to force the ES or
+desktop path. The ES path renders to and reads back RGBA32F render targets, so
+the context must expose `EXT_color_buffer_float`; an incomplete readback
+framebuffer is reported on stderr and the bake continues. A native GLES3 smoke
+test is available in [`test/`](test/README.md).
+
 You may want to use [thekla_atlas](https://github.com/Thekla/thekla_atlas) / [xatlas](https://github.com/jpcy/xatlas) or [uvatlas](https://github.com/microsoft/UVAtlas) to prepare your geometry for lightmapping.
 
 # Example application
